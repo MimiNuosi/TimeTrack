@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-Item ''d:\\TimeTrack\\TimeTrack.exe'' -ErrorAction SilentlyContinue | Select-Object Name, Length, LastWriteTime\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Remove-Item ''d:\\TimeTrack\\build_debug.ps1'' -ErrorAction SilentlyContinue; Remove-Item ''d:\\TimeTrack\\diagnose.ps1'' -ErrorAction SilentlyContinue; Remove-Item ''d:\\TimeTrack\\test.ps1'' -ErrorAction SilentlyContinue; Remove-Item ''d:\\TimeTrack\\TimeTrack_dbg.exe'' -ErrorAction SilentlyContinue; Remove-Item ''d:\\TimeTrack\\TimeTrack_init.log'' -ErrorAction SilentlyContinue; Write-Host ''Temp files cleaned up''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Remove-Item ''d:\\TimeTrack\\TimeTrack.exe'' -Force -ErrorAction SilentlyContinue; Write-Host ''Cleaned''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"d:\\TimeTrack\\build.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Start-Process ''d:\\TimeTrack\\TimeTrack.exe'' -WindowStyle Hidden; Start-Sleep 2; $p = Get-Process TimeTrack -ErrorAction SilentlyContinue; if ($p) { Write-Host ''RUNNING - SUCCESS!''; Stop-Process -Name TimeTrack -Force } else { Write-Host ''FAILED to start'' }\")",
+      "Bash(cmd /c \"start /b d:\\TimeTrack\\TimeTrack.exe & timeout /t 2 /nobreak >nul & tasklist /fi \"IMAGENAME eq TimeTrack.exe\" 2>&1 & taskkill /f /im TimeTrack.exe >nul 2>&1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"d:\\TimeTrack\\_verify.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Remove-Item ''d:\\TimeTrack\\_verify.ps1'' -ErrorAction SilentlyContinue; Write-Host ''Done''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Remove-Item ''d:\\TimeTrack\\test.ps1'' -ErrorAction SilentlyContinue; Write-Host ''Cleaned for test''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"d:\\TimeTrack\\test_scenarios.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Remove-Item ''d:\\TimeTrack\\test_scenarios.ps1'' -ErrorAction SilentlyContinue; Write-Host ''Test files cleaned''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; $proc = Start-Process ''d:\\TimeTrack\\TimeTrack.exe'' -PassThru -WindowStyle Hidden; Start-Sleep 3; $p = Get-Process -Name TimeTrack -ErrorAction SilentlyContinue; if ($p) { Write-Host ''OK: Process running, PID='' $p.Id; Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue } else { Write-Host ''FAIL: Process not found'' }\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Remove-Item ''d:\\TimeTrack\\_verify.ps1'' -ErrorAction SilentlyContinue; Write-Host ''Done''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Write-Host ''Killed any running instances''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"$f = Get-Item ''d:\\TimeTrack\\TimeTrack.exe'' -ErrorAction SilentlyContinue; if ($f) { Write-Host (''SUCCESS: '' + $f.Name + '' '' + $f.Length + '' bytes '' + $f.LastWriteTime) } else { Write-Host ''FAILED: No exe produced'' }\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Get-Item ''d:\\TimeTrack\\TimeTrack.exe'' -ErrorAction SilentlyContinue | Select-Object Name, Length, LastWriteTime\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Write-Host ''Killed''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"$proc = Start-Process ''d:\\TimeTrack\\TimeTrack.exe'' -PassThru -WindowStyle Hidden; Start-Sleep 3; $p = Get-Process -Name TimeTrack -ErrorAction SilentlyContinue; if ($p) { Write-Host ''OK: Process running, PID='' $p.Id; Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue } else { Write-Host ''FAIL: Process not found'' }\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name TimeTrack -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Start-Process ''d:\\TimeTrack\\TimeTrack.exe'' -WindowStyle Hidden; Start-Sleep 3; $p = Get-Process -Name TimeTrack -ErrorAction SilentlyContinue; if ($p) { Write-Host (''OK: PID='' + $p.Id); Stop-Process -Name TimeTrack -Force } else { Write-Host ''FAIL'' }\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Get-Item ''d:\\TimeTrack\\timetrack.ico'' -ErrorAction SilentlyContinue | Select-Object Name, Length, LastWriteTime\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
