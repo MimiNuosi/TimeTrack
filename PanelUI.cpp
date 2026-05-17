@@ -10,8 +10,12 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
-// 链接 Common Controls 库
+#include <d2d1.h>
+#include <dwrite.h>
+
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 namespace PanelUI {
 
@@ -35,6 +39,43 @@ int                    g_lastActiveIndex  = -1;
 std::map<std::wstring, int> g_appToIndex;
 std::vector<std::wstring>   g_displayedAppPaths;
 
+// ============================================================================
+// DirectWrite 文字渲染支持
+// ============================================================================
+
+// COM 安全释放宏
+#define SAFE_RELEASE_DW(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while(0)
+
+// DirectWrite 全局对象
+ID2D1Factory*       g_pD2DFactory         = nullptr;
+IDWriteFactory*     g_pDWriteFactory      = nullptr;
+IDWriteTextFormat*  g_pTextFormatHeader   = nullptr;
+IDWriteTextFormat*  g_pTextFormatNormal   = nullptr;
+
+// 缓存的列表条目绘制数据（与 g_displayedAppPaths 一一对应）
+std::vector<ListItemDisplay> g_listItemDisplay;
+
+// 子类化原始窗口过程指针
+static WNDPROC g_pfnOrigHeaderProc  = nullptr;
+static WNDPROC g_pfnOrigListViewProc = nullptr;
+
+// 缓存头部文本（供 DirectWrite 绘制使用）
+static std::wstring g_sHeaderText;
+
+// 子类化窗口过程的前向声明（在 Initialize 之后定义）
+static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg,
+                                            WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg,
+                                              WPARAM wParam, LPARAM lParam);
+
+// DWrite 字号（通过 CreateTextFormat 传递 DIP 值, 1 DIP = 1/96 inch）
+static const FLOAT HEADER_FONT_SIZE_DIP = 16.0f;  // 等价于 12pt
+static const FLOAT NORMAL_FONT_SIZE_DIP = 12.0f;  // 等价于 9pt
+
+// 浅色主题颜色常量
+static const COLORREF CLR_LIST_BG    = RGB(255, 255, 255);  // ListView 背景白
+static const COLORREF CLR_LIST_TEXT_BG = RGB(255, 255, 255);  // ListView 文字背景白
+
 // 字体常量（预留多语言切换）
 static const wchar_t* FONT_FACE     = L"Segoe UI";
 static const wchar_t* BTN_PREV      = L"\u25C0";  // ◀
@@ -57,6 +98,9 @@ static const int COL_APP_MIN_WIDTH = 120;
 
 // 按钮尺寸常量
 static const int BTN_W = 100;
+
+// 图标尺寸
+static const int ICON_SIZE = 16;  // 小图标 16×16 像素
 static const int BTN_H = 28;
 static const int MARGIN = 5;
 static const int HEADER_H = 28;
@@ -118,9 +162,18 @@ static std::wstring FormatPercentW(uint64_t seconds, uint64_t totalSeconds) {
 // Initialize — 创建所有子控件
 // ============================================================================
 
-void Initialize(HWND hwndParent, HINSTANCE hInst, HFONT hFont) {
-    // ---- 共享样式：子窗口 + 可见（除 ListView 外都加上 WS_TABSTOP） ----
-    DWORD ctrlStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+void Initialize(HWND hwndParent, HINSTANCE hInst,
+                HFONT hFontHeader, HFONT hFontNormal)
+{
+    // ---- 共享样式：子窗口 + 可见 + 扁平边框（除 ListView 外都加上 WS_TABSTOP） ----
+    DWORD ctrlStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT;
+
+    // 按钮样式追加 BS_FLAT 的便捷 lambda
+    auto MakeFlat = [](HWND hBtn) {
+        LONG_PTR style = GetWindowLongPtrW(hBtn, GWL_STYLE);
+        style |= BS_FLAT;
+        SetWindowLongPtrW(hBtn, GWL_STYLE, style);
+    };
 
     // ---- 头部区域 ----
     // 日期 + 总时长静态文本（左对齐，可接收点击用作日期选择）
@@ -144,20 +197,27 @@ void Initialize(HWND hwndParent, HINSTANCE hInst, HFONT hFont) {
         ctrlStyle, 0, 0, TODAY_BTN_W, BTN_H,
         hwndParent, (HMENU)IDC_BTN_TODAY, hInst, nullptr);
 
-    // ---- 主 ListView（报告视图 + 整行选择 + 网格线） ----
+    // ---- 主 ListView（报告视图 + 整行选择 + 网格线 + 双缓冲） ----
     // LVS_REPORT:          报告视图（列标题 + 行）
     // LVS_SINGLESEL:       单选
     // LVS_SHOWSELALWAYS:   即使失焦也显示选中
     // LVS_EX_FULLROWSELECT: 整行选中（扩展样式）
+    // LVS_EX_GRIDLINES:     网格线
+    // LVS_EX_DOUBLEBUFFER:  消除刷新闪烁
     hListView = CreateWindowExW(0, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         0, 0, 400, 200,
         hwndParent, (HMENU)IDC_LISTVIEW, hInst, nullptr);
 
-    // 设置扩展样式：整行选中
+    // 设置扩展样式：整行选中 + 网格线 + 双缓冲
     ListView_SetExtendedListViewStyleEx(hListView,
-        LVS_EX_FULLROWSELECT, LVS_EX_FULLROWSELECT);
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+    // 选中行颜色：蓝底白字（背景色由系统自动处理）
+    ListView_SetBkColor(hListView, CLR_LIST_BG);
+    ListView_SetTextBkColor(hListView, CLR_LIST_TEXT_BG);
 
     // 添加列
     LVCOLUMNW lvc = {};
@@ -191,31 +251,53 @@ void Initialize(HWND hwndParent, HINSTANCE hInst, HFONT hFont) {
     hBtnRefresh = CreateWindowExW(0, L"BUTTON", BTN_REFRESH,
         ctrlStyle, 0, 0, BTN_W, BTN_H,
         hwndParent, (HMENU)IDC_BTN_REFRESH, hInst, nullptr);
+    MakeFlat(hBtnRefresh);
 
     hBtnIgnore = CreateWindowExW(0, L"BUTTON", BTN_IGNORE,
         ctrlStyle, 0, 0, BTN_W + 30, BTN_H,
         hwndParent, (HMENU)IDC_BTN_IGNORE, hInst, nullptr);
+    MakeFlat(hBtnIgnore);
 
     hBtnSettings = CreateWindowExW(0, L"BUTTON", BTN_SETTINGS,
         ctrlStyle, 0, 0, BTN_W, BTN_H,
         hwndParent, (HMENU)IDC_BTN_SETTINGS, hInst, nullptr);
+    MakeFlat(hBtnSettings);
 
     hBtnClose = CreateWindowExW(0, L"BUTTON", BTN_CLOSE,
         ctrlStyle, 0, 0, BTN_W, BTN_H,
         hwndParent, (HMENU)IDC_BTN_CLOSE, hInst, nullptr);
+    MakeFlat(hBtnClose);
 
     // ---- 应用字体 ----
-    if (hFont) {
-        SendMessageW(hHeader,       WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnPrevDay,   WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnNextDay,   WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnToday,     WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hListView,     WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnRefresh,   WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnIgnore,    WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnSettings,  WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnClose,     WM_SETFONT, (WPARAM)hFont, TRUE);
+    // 标题栏：12pt bold
+    if (hFontHeader) {
+        SendMessageW(hHeader, WM_SETFONT, (WPARAM)hFontHeader, TRUE);
     }
+    // ListView、按钮：9pt regular
+    if (hFontNormal) {
+        SendMessageW(hBtnPrevDay,   WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnNextDay,   WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnToday,     WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hListView,     WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnRefresh,   WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnIgnore,    WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnSettings,  WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+        SendMessageW(hBtnClose,     WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+    }
+
+    // ---- 初始化 DirectWrite（失败则继续使用 GDI 回退） ----
+    InitDirectWrite();
+
+    // ---- 子类化控件：替换 GDI 文本绘制为 DirectWrite ----
+    // 头部 STATIC 控件
+    g_pfnOrigHeaderProc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(hHeader, GWLP_WNDPROC,
+                          reinterpret_cast<LONG_PTR>(HeaderSubclassProc)));
+
+    // ListView 控件
+    g_pfnOrigListViewProc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(hListView, GWLP_WNDPROC,
+                          reinterpret_cast<LONG_PTR>(ListViewSubclassProc)));
 }
 
 // ============================================================================
@@ -288,7 +370,12 @@ void UpdateHeader(const std::string& date, uint64_t totalSeconds) {
         text += L"  (history)";
     }
 
-    SetWindowTextW(hHeader, text.c_str());
+    // 缓存文本供 DirectWrite 子类化过程使用（仅 DWrite 绘制，不设 GDI 文本）
+    g_sHeaderText = text;
+
+    // 强制重绘并擦除背景（触发 HeaderSubclassProc 的 WM_PAINT）
+    // TRUE = 擦除背景，清除上一帧可能的 GDI 残留
+    InvalidateRect(hHeader, nullptr, TRUE);
 }
 
 // 头部总时长（纯 wstring，零栈缓冲区）
@@ -296,6 +383,458 @@ std::wstring FormatHeaderTotal(uint64_t totalSec) {
     uint64_t h = totalSec / 3600;
     uint64_t m = (totalSec % 3600) / 60;
     return L"Total: " + std::to_wstring(h) + L"h " + std::to_wstring(m) + L"m";
+}
+
+// ============================================================================
+// InitDirectWrite — 初始化 Direct2D 工厂和 DirectWrite 文本格式
+// 返回值：true 表示成功，false 表示失败（程序可继续运行，回退到 GDI）
+// ============================================================================
+
+bool InitDirectWrite() {
+    HRESULT hr;
+
+    // 创建 Direct2D 工厂（单线程模式，程序只在主 UI 线程访问）
+    // D2D1_FACTORY_TYPE_SINGLE_THREADED: 无需跨线程同步，性能最优
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                           __uuidof(ID2D1Factory),
+                           reinterpret_cast<void**>(&g_pD2DFactory));
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[PanelUI] D2D1CreateFactory failed\n");
+        return false;
+    }
+
+    // 创建 DirectWrite 工厂（共享模式，允许系统缓存字体数据）
+    // DWRITE_FACTORY_TYPE_SHARED: 多实例共享字体缓存，减少内存
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                              __uuidof(IDWriteFactory),
+                              reinterpret_cast<IUnknown**>(&g_pDWriteFactory));
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[PanelUI] DWriteCreateFactory failed\n");
+        SAFE_RELEASE_DW(g_pD2DFactory);
+        return false;
+    }
+
+    // Header 文本格式：Segoe UI Bold 16 DIP (~12pt)
+    hr = g_pDWriteFactory->CreateTextFormat(
+        FONT_FACE, nullptr,
+        DWRITE_FONT_WEIGHT_BOLD,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        HEADER_FONT_SIZE_DIP,
+        L"en-us",
+        &g_pTextFormatHeader);
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[PanelUI] CreateTextFormat(header) failed\n");
+        CleanupDirectWrite();
+        return false;
+    }
+
+    // 普通文本格式：Segoe UI Normal 12 DIP (~9pt)
+    hr = g_pDWriteFactory->CreateTextFormat(
+        FONT_FACE, nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        NORMAL_FONT_SIZE_DIP,
+        L"en-us",
+        &g_pTextFormatNormal);
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[PanelUI] CreateTextFormat(normal) failed\n");
+        CleanupDirectWrite();
+        return false;
+    }
+
+    // 设置对齐方式
+    g_pTextFormatHeader->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_pTextFormatHeader->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    g_pTextFormatNormal->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_pTextFormatNormal->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    OutputDebugStringW(L"[PanelUI] DirectWrite initialized successfully\n");
+    return true;
+}
+
+// ============================================================================
+// CleanupDirectWrite — 释放所有 DirectWrite/Direct2D COM 对象
+// 同时恢复子类化的窗口过程，避免崩溃
+// ============================================================================
+
+void CleanupDirectWrite() {
+    // 恢复子类化窗口过程
+    if (g_pfnOrigHeaderProc && hHeader && IsWindow(hHeader)) {
+        SetWindowLongPtrW(hHeader, GWLP_WNDPROC, (LONG_PTR)g_pfnOrigHeaderProc);
+    }
+    if (g_pfnOrigListViewProc && hListView && IsWindow(hListView)) {
+        SetWindowLongPtrW(hListView, GWLP_WNDPROC, (LONG_PTR)g_pfnOrigListViewProc);
+    }
+    g_pfnOrigHeaderProc = nullptr;
+    g_pfnOrigListViewProc = nullptr;
+
+    // 释放 DirectWrite 文本格式
+    SAFE_RELEASE_DW(g_pTextFormatNormal);
+    SAFE_RELEASE_DW(g_pTextFormatHeader);
+    // 释放 DWrite 工厂
+    SAFE_RELEASE_DW(g_pDWriteFactory);
+    // 释放 D2D 工厂（最后释放，因为其他对象依赖于它——引用计数管理）
+    SAFE_RELEASE_DW(g_pD2DFactory);
+
+    g_listItemDisplay.clear();
+    g_sHeaderText.clear();
+}
+
+// ============================================================================
+// HeaderSubclassProc — 头部 STATIC 控件的子类化窗口过程
+// 使用 DirectWrite 绘制日期/总时长文本，实现超清晰字体渲染
+// 回退策略：如果 D2D 不可用，调用原始窗口过程回退到 GDI
+// ============================================================================
+
+static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg,
+                                            WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        // 如果 DWrite 未初始化或无可绘制文本，回退到 GDI
+        if (!g_pD2DFactory || !g_pTextFormatHeader || g_sHeaderText.empty()) {
+            return CallWindowProcW(g_pfnOrigHeaderProc, hwnd, msg, wParam, lParam);
+        }
+
+        PAINTSTRUCT ps = {};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (!hdc) return 0;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        // 创建 DC 渲染目标（绑定到 BeginPaint 提供的 HDC）
+        D2D1_RENDER_TARGET_PROPERTIES props = {};
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
+        ID2D1DCRenderTarget* pRT = nullptr;
+        HRESULT hr = g_pD2DFactory->CreateDCRenderTarget(&props, &pRT);
+        if (SUCCEEDED(hr)) {
+            hr = pRT->BindDC(hdc, &rc);
+            if (SUCCEEDED(hr)) {
+                // DPI 感知（适配系统缩放比例）
+                FLOAT dpiX, dpiY;
+                pRT->GetDpi(&dpiX, &dpiY);
+
+                pRT->BeginDraw();
+                pRT->SetDpi(dpiX, dpiY);
+
+                // 使用与父窗口背景一致的浅灰色填充（RGB(243,243,243)=0xF3F3F3）
+                // 避免上一帧残留的 GDI 文本透过 DWrite 文字层显示
+                pRT->Clear(D2D1::ColorF(0xF3F3F3));
+
+                // 创建文字笔刷（深灰 #1A1A1A = RGB(26,26,26)）
+                ID2D1SolidColorBrush* pBrush = nullptr;
+                hr = pRT->CreateSolidColorBrush(
+                    D2D1::ColorF(0x1A1A1A), &pBrush);
+                if (SUCCEEDED(hr) && pBrush) {
+                    D2D1_RECT_F textRect = {
+                        0.0f, 0.0f,
+                        static_cast<FLOAT>(rc.right - rc.left),
+                        static_cast<FLOAT>(rc.bottom - rc.top)
+                    };
+
+                    // 使用 DirectWrite 绘制文本（ClearType 抗锯齿）
+                    pRT->DrawTextW(
+                        g_sHeaderText.c_str(),
+                        (UINT32)g_sHeaderText.size(),
+                        g_pTextFormatHeader,
+                        textRect,
+                        pBrush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP |
+                        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+                    pBrush->Release();
+                }
+
+                // 提交 D2D 绘制到 HDC
+                hr = pRT->EndDraw();
+                if (FAILED(hr)) {
+                    OutputDebugStringW(L"[PanelUI] Header D2D EndDraw failed, "
+                                       L"returning empty\n");
+                    // EndPaint 已调用，不能再次触发原始 WM_PAINT（会导致双重绘制）
+                    // 返回 0，区域保持 Clear() 后的空背景色
+                    pRT->Release();
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
+            }
+            pRT->Release();
+        } else {
+            // D2D 创建失败，区域保持父窗口背景色
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        // 完全由 WM_PAINT 处理绘制，禁止擦除（避免闪烁）
+        return 1;
+
+    case WM_SIZE:
+        // 窗口大小改变 → 强制重绘并擦除背景（适配新尺寸的 D2D 渲染目标）
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+
+    default:
+        break;
+    }
+
+    return CallWindowProcW(g_pfnOrigHeaderProc, hwnd, msg, wParam, lParam);
+}
+
+// ============================================================================
+// ListViewSubclassProc — ListView 控件的子类化窗口过程
+// 使用 DirectWrite 绘制所有列表项文本（列标题由 Header 子控件自行处理）
+// 支持：选择高亮、图标、网格线、文本列对齐
+// 回退策略：D2D 不可用 → 调用原始窗口过程
+// ============================================================================
+
+static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg,
+                                              WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        // 如果 DWrite 未初始化，回退到 GDI
+        if (!g_pD2DFactory || !g_pTextFormatNormal) {
+            return CallWindowProcW(g_pfnOrigListViewProc, hwnd, msg, wParam, lParam);
+        }
+
+        PAINTSTRUCT ps = {};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (!hdc) return 0;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        // 创建 DC 渲染目标
+        D2D1_RENDER_TARGET_PROPERTIES props = {};
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
+        ID2D1DCRenderTarget* pRT = nullptr;
+        HRESULT hr = g_pD2DFactory->CreateDCRenderTarget(&props, &pRT);
+        if (FAILED(hr)) {
+            // D2D 不可用 → 返回 0（区域保持白色背景）
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        hr = pRT->BindDC(hdc, &rc);
+        if (FAILED(hr)) {
+            pRT->Release();
+            // BindDC 失败 → 返回 0，区域保持白色背景
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        pRT->BeginDraw();
+
+        // ---- 清空背景（白色） ----
+        pRT->Clear(D2D1::ColorF(D2D1::ColorF::White));
+
+        // 获取列表状态
+        int itemCount = ListView_GetItemCount(hwnd);
+        int topIdx = ListView_GetTopIndex(hwnd);
+        int countPerPage = ListView_GetCountPerPage(hwnd);
+        int bottomIdx = min(topIdx + countPerPage, itemCount);
+
+        if (topIdx < 0 || itemCount <= 0 || itemCount != (int)g_listItemDisplay.size()) {
+            // 无数据或数据不一致 → 只画背景即可
+            goto EndListViewDraw;
+        }
+
+        // ---- 获取列宽 ----
+        int colWidths[4];
+        colWidths[0] = ListView_GetColumnWidth(hwnd, 0);
+        colWidths[1] = ListView_GetColumnWidth(hwnd, 1);
+        colWidths[2] = ListView_GetColumnWidth(hwnd, 2);
+        colWidths[3] = ListView_GetColumnWidth(hwnd, 3);
+        int totalColW = colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3];
+
+        // ---- 获取项高度 ----
+        int itemH = 20; // 默认
+        if (itemCount > 0) {
+            RECT rcItem = {};
+            if (SendMessageW(hwnd, LVM_GETITEMRECT, 0, (LPARAM)&rcItem)) {
+                itemH = rcItem.bottom - rcItem.top;
+            }
+        }
+
+        // ---- 获取选中项 ----
+        int selIdx = ListView_GetNextItem(hwnd, -1, LVNI_SELECTED);
+
+        // ---- 创建选中高亮笔刷 ----
+        ID2D1SolidColorBrush* pBrushText = nullptr;
+        hr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x1A1A1A), &pBrushText);
+        if (FAILED(hr)) goto EndListViewDraw;
+
+        ID2D1SolidColorBrush* pBrushSel = nullptr;
+        hr = pRT->CreateSolidColorBrush(
+            D2D1::ColorF(0xCCE8FF), // 浅蓝选中背景
+            &pBrushSel);
+        if (FAILED(hr)) { pBrushText->Release(); goto EndListViewDraw; }
+
+        ID2D1SolidColorBrush* pBrushSelText = nullptr;
+        hr = pRT->CreateSolidColorBrush(
+            D2D1::ColorF(0x000000), // 选中行文字黑色
+            &pBrushSelText);
+        if (FAILED(hr)) { pBrushText->Release(); pBrushSel->Release(); goto EndListViewDraw; }
+
+        ID2D1SolidColorBrush* pBrushGrid = nullptr;
+        hr = pRT->CreateSolidColorBrush(
+            D2D1::ColorF(0xE0E0E0), // 浅灰网格线
+            &pBrushGrid);
+        if (FAILED(hr)) {
+            pBrushText->Release(); pBrushSel->Release(); pBrushSelText->Release();
+            goto EndListViewDraw;
+        }
+
+        // ---- 绘制可见项 ----
+        for (int i = topIdx; i < bottomIdx && i < (int)g_listItemDisplay.size(); ++i) {
+            int y = (i - topIdx) * itemH;
+            const auto& item = g_listItemDisplay[i];
+
+            // 每行背景
+            D2D1_RECT_F rowRect = { 0.0f, (FLOAT)y, (FLOAT)totalColW, (FLOAT)(y + itemH) };
+            if (i == selIdx) {
+                pRT->FillRectangle(&rowRect, pBrushSel);
+            } else if (i % 2 == 1) {
+                // 交替行浅灰色（偶数索引为白色，奇数索引为极浅灰）
+                ID2D1SolidColorBrush* pAlt = nullptr;
+                hr = pRT->CreateSolidColorBrush(D2D1::ColorF(0xF5F5F5), &pAlt);
+                if (SUCCEEDED(hr)) {
+                    pRT->FillRectangle(&rowRect, pAlt);
+                    pAlt->Release();
+                }
+            }
+
+            // 第0列：图标 + 应用名称
+            int x = 4; // 左边距
+            int textX = x + 20; // 图标(16px) + 间距 = 20px
+
+            D2D1_RECT_F textRect0 = {
+                (FLOAT)textX, (FLOAT)y + 1.0f,
+                (FLOAT)(textX + colWidths[0] - textX - 4), (FLOAT)(y + itemH - 1)
+            };
+            ID2D1Brush* brush0 = (i == selIdx) ? pBrushSelText : pBrushText;
+            pRT->DrawTextW(
+                item.displayName.c_str(),
+                (UINT32)item.displayName.size(),
+                g_pTextFormatNormal,
+                textRect0,
+                brush0,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+            // 第1列：时长（右对齐）
+            int x1 = colWidths[0];
+            D2D1_RECT_F textRect1 = {
+                (FLOAT)(x1 + 4), (FLOAT)y + 1.0f,
+                (FLOAT)(x1 + colWidths[1] - 4), (FLOAT)(y + itemH - 1)
+            };
+            pRT->DrawTextW(
+                item.duration.c_str(),
+                (UINT32)item.duration.size(),
+                g_pTextFormatNormal,
+                textRect1,
+                brush0,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+            // 第2列：百分比（右对齐）
+            int x2 = x1 + colWidths[1];
+            D2D1_RECT_F textRect2 = {
+                (FLOAT)(x2 + 4), (FLOAT)y + 1.0f,
+                (FLOAT)(x2 + colWidths[2] - 4), (FLOAT)(y + itemH - 1)
+            };
+            pRT->DrawTextW(
+                item.percent.c_str(),
+                (UINT32)item.percent.size(),
+                g_pTextFormatNormal,
+                textRect2,
+                brush0,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+            // 第3列：状态（左对齐）
+            int x3 = x2 + colWidths[2];
+            if (colWidths[3] > 0 && !item.status.empty()) {
+                D2D1_RECT_F textRect3 = {
+                    (FLOAT)(x3 + 4), (FLOAT)y + 1.0f,
+                    (FLOAT)(x3 + colWidths[3] - 4), (FLOAT)(y + itemH - 1)
+                };
+                pRT->DrawTextW(
+                    item.status.c_str(),
+                    (UINT32)item.status.size(),
+                    g_pTextFormatNormal,
+                    textRect3,
+                    brush0,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            }
+        }
+
+        // ---- 绘制水平网格线 ----
+        int visibleCount = min(bottomIdx - topIdx, (int)g_listItemDisplay.size() - topIdx);
+        for (int i = 0; i <= visibleCount; ++i) {
+            int y = i * itemH;
+            D2D1_POINT_2F pt1 = { 0.0f, (FLOAT)y };
+            D2D1_POINT_2F pt2 = { (FLOAT)totalColW, (FLOAT)y };
+            pRT->DrawLine(pt1, pt2, pBrushGrid, 0.5f);
+        }
+
+        // ---- 释放笔刷 ----
+        pBrushGrid->Release();
+        pBrushSelText->Release();
+        pBrushSel->Release();
+        pBrushText->Release();
+
+EndListViewDraw:
+        // 提交 D2D 绘制
+        hr = pRT->EndDraw();
+        if (FAILED(hr)) {
+            OutputDebugStringW(L"[PanelUI] ListView D2D EndDraw failed\n");
+            // EndPaint 已调用，不能再次触发原始 WM_PAINT（导致双重绘制）
+            pRT->Release();
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        pRT->Release();
+
+        // ---- D2D 绘制完成后，使用 GDI 绘制图标（在 HDC 上层叠） ----
+        HIMAGELIST himl = AppIconCache::GetImageList();
+        if (himl && itemCount > 0 && itemCount == (int)g_listItemDisplay.size()) {
+            for (int i = topIdx; i < bottomIdx && i < (int)g_listItemDisplay.size(); ++i) {
+                int iconIdx = g_listItemDisplay[i].iconIndex;
+                if (iconIdx >= 0) {
+                    int y = (i - topIdx) * itemH;
+                    int iconY = y + (itemH - ICON_SIZE) / 2;
+                    ImageList_Draw(himl, iconIdx, hdc, 4, iconY, ILD_TRANSPARENT);
+                }
+            }
+        }
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        // 完全由 WM_PAINT 绘制，禁止擦除（避免闪烁）
+        return 1;
+
+    case WM_SIZE:
+        // 窗口大小改变 → 强制重绘并擦除背景
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+
+    default:
+        break;
+    }
+
+    return CallWindowProcW(g_pfnOrigListViewProc, hwnd, msg, wParam, lParam);
 }
 
 // ============================================================================
@@ -337,44 +876,58 @@ void RefreshIncremental(const DailyData& today,
     // 清除旧 [ACTIVE] 状态
     if (g_lastActiveIndex >= 0 && g_lastActiveIndex < (int)g_displayedAppPaths.size()) {
         LvSetItemText(hListView, g_lastActiveIndex, 3, L"");
+        if (g_lastActiveIndex < (int)g_listItemDisplay.size()) {
+            g_listItemDisplay[g_lastActiveIndex].status.clear();
+        }
     }
 
-    // 找到当前应用的行并更新
+    // 遍历并更新每行的秒数数据（所有条目都可能更新）
     for (size_t i = 0; i < g_displayedAppPaths.size(); ++i) {
-        bool isCurrent = (_wcsicmp(g_displayedAppPaths[i].c_str(), currentApp.c_str()) == 0);
-        if (isCurrent) {
-            currentIdx = (int)i;
-            // 在 today.entries 中查找该应用的秒数
-            for (const auto& entry : today.entries) {
-                if (_wcsicmp(entry.appPath.c_str(), currentApp.c_str()) == 0) {
-                    // 更新 Duration 列（按秒数降序，序号不变所以直接更新行）
-                    std::wstring dur = FormatDurationW(entry.seconds);
-                    LvSetItemText(hListView, currentIdx, 1, dur.c_str());
+        // 查找该路径在 today.entries 中的最新秒数
+        for (const auto& entry : today.entries) {
+            if (_wcsicmp(entry.appPath.c_str(), g_displayedAppPaths[i].c_str()) == 0) {
+                std::wstring dur = FormatDurationW(entry.seconds);
+                std::wstring pct = FormatPercentW(entry.seconds, today.totalSeconds);
 
-                    // 更新 Percent 列
-                    std::wstring pct = FormatPercentW(entry.seconds, today.totalSeconds);
-                    LvSetItemText(hListView, currentIdx, 2, pct.c_str());
+                // 更新 GDI 文本（辅助功能需要）
+                LvSetItemText(hListView, (int)i, 1, dur.c_str());
+                LvSetItemText(hListView, (int)i, 2, pct.c_str());
 
-                    break;
+                // 更新 DirectWrite 缓存数据
+                if (i < g_listItemDisplay.size()) {
+                    g_listItemDisplay[i].duration = dur;
+                    g_listItemDisplay[i].percent = pct;
                 }
+
+                // 标记是否为当前活动应用
+                bool isCurrent = (_wcsicmp(g_displayedAppPaths[i].c_str(), currentApp.c_str()) == 0);
+                if (isCurrent) {
+                    currentIdx = (int)i;
+                }
+                break;
             }
-            break;
         }
     }
 
     // 设置新 [ACTIVE] 状态
     if (currentIdx >= 0) {
         LvSetItemText(hListView, currentIdx, 3, L"[ACTIVE]");
+        if (currentIdx < (int)g_listItemDisplay.size()) {
+            g_listItemDisplay[currentIdx].status = L"[ACTIVE]";
+        }
         g_lastActiveIndex = currentIdx;
     } else {
         g_lastActiveIndex = -1;
     }
 
-    // 更新 appToIndex 映射（条目可能因排序而位置变化）
+    // 更新 appToIndex 映射
     g_appToIndex.clear();
     for (size_t i = 0; i < g_displayedAppPaths.size(); ++i) {
         g_appToIndex[g_displayedAppPaths[i]] = (int)i;
     }
+
+    // 触发 DirectWrite 重绘（每秒更新）
+    InvalidateRect(hListView, nullptr, FALSE);
 }
 
 // ============================================================================
@@ -386,12 +939,14 @@ void RefreshFull(const DailyData& data) {
     ListView_DeleteAllItems(hListView);
     g_appToIndex.clear();
     g_displayedAppPaths.clear();
+    g_listItemDisplay.clear();
     g_lastActiveIndex = -1;
 
     // 更新头部
     UpdateHeader(data.date, data.totalSeconds);
 
     if (data.entries.empty()) {
+        InvalidateRect(hListView, nullptr, FALSE);
         return;
     }
 
@@ -402,7 +957,7 @@ void RefreshFull(const DailyData& data) {
             return a.seconds > b.seconds;
         });
 
-    // 添加到 ListView
+    // 添加到 ListView（同时填充 g_listItemDisplay 供 DirectWrite 绘制）
     for (size_t i = 0; i < sorted.size(); ++i) {
         const auto& entry = sorted[i];
 
@@ -410,7 +965,8 @@ void RefreshFull(const DailyData& data) {
         item.mask = LVIF_TEXT | LVIF_IMAGE;
         item.iItem = (int)i;
         item.pszText = const_cast<LPWSTR>(entry.displayName.c_str());
-        item.iImage = AppIconCache::GetOrLoadIcon(entry.appPath);
+        int iconIdx = AppIconCache::GetOrLoadIcon(entry.appPath);
+        item.iImage = iconIdx;
 
         // 如果显示名称为空，使用文件基本名
         std::wstring fallbackName;
@@ -421,18 +977,21 @@ void RefreshFull(const DailyData& data) {
             item.pszText = const_cast<LPWSTR>(fallbackName.c_str());
         }
 
+        // 构建 DirectWrite 显示数据（在 GDI 插入之前）
+        ListItemDisplay ld;
+        ld.displayName = entry.displayName.empty() ? fallbackName : entry.displayName;
+        ld.duration = FormatDurationW(entry.seconds);
+        ld.percent = FormatPercentW(entry.seconds, data.totalSeconds);
+        ld.status = L"";
+        ld.iconIndex = iconIdx;
+        g_listItemDisplay.push_back(ld);
+
         int idx = ListView_InsertItem(hListView, &item);
         if (idx >= 0) {
-            // Duration
-            std::wstring dur = FormatDurationW(entry.seconds);
-            LvSetItemText(hListView, idx, 1, dur.c_str());
-
-            // Percent
-            std::wstring pct = FormatPercentW(entry.seconds, data.totalSeconds);
-            LvSetItemText(hListView, idx, 2, pct.c_str());
-
-            // Status（初始为空）
-            LvSetItemText(hListView, idx, 3, L"");
+            // 设置 GDI 文本（辅助功能/无障碍使用需要）
+            LvSetItemText(hListView, idx, 1, ld.duration.c_str());
+            LvSetItemText(hListView, idx, 2, ld.percent.c_str());
+            LvSetItemText(hListView, idx, 3, ld.status.c_str());
         }
 
         g_appToIndex[entry.appPath] = idx;
@@ -443,6 +1002,9 @@ void RefreshFull(const DailyData& data) {
     if (g_isHistoryMode) {
         UpdateHeader(data.date, data.totalSeconds);
     }
+
+    // 触发 DirectWrite 重绘
+    InvalidateRect(hListView, nullptr, FALSE);
 }
 
 // ============================================================================
@@ -508,6 +1070,9 @@ std::wstring GetSelectedAppPath() {
 // ============================================================================
 
 void Cleanup() {
+    // 清理 DirectWrite/Direct2D 资源（释放 COM 对象，恢复子类化过程）
+    CleanupDirectWrite();
+
     // 销毁图标 ImageList（释放所有托管图标）
     AppIconCache::Cleanup();
 
@@ -515,7 +1080,9 @@ void Cleanup() {
     // 仅清除映射数据
     g_appToIndex.clear();
     g_displayedAppPaths.clear();
+    g_listItemDisplay.clear();
     g_lastActiveIndex = -1;
+    g_sHeaderText.clear();
 }
 
 } // namespace PanelUI

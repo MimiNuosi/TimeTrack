@@ -10,6 +10,11 @@
 #include <map>
 #include "Types.h"
 
+// Direct2D / DirectWrite 前置声明（避免在头文件中引入完整 d2d1.h/dwrite.h）
+struct ID2D1Factory;
+struct IDWriteFactory;
+struct IDWriteTextFormat;
+
 namespace PanelUI {
 
 // ---- 控件句柄（供外部查询和消息处理） ----
@@ -36,10 +41,11 @@ extern std::vector<std::wstring> g_displayedAppPaths;
 // ---- 公开接口 ----
 
 // 在 WM_CREATE 时调用：创建所有子控件
-// hwndParent: 主窗口句柄
-// hInst:      HINSTANCE 用于 CreateWindowEx
-// hFont:      使用 Segoe UI 9pt 字体（若为 nullptr 则使用系统默认）
-void Initialize(HWND hwndParent, HINSTANCE hInst, HFONT hFont);
+// hwndParent:   主窗口句柄
+// hInst:        HINSTANCE 用于 CreateWindowEx
+// hFontHeader:  12pt bold 字体（标题栏用）
+// hFontNormal:  9pt regular 字体（ListView / 按钮用）
+void Initialize(HWND hwndParent, HINSTANCE hInst, HFONT hFontHeader, HFONT hFontNormal);
 
 // 在 WM_SIZE 时调用：重新布局所有控件
 // cx, cy: 窗口客户区宽度和高度
@@ -78,5 +84,27 @@ std::wstring FormatHeaderTotal(uint64_t totalSec);
 
 // 清理资源（WM_DESTROY 时调用）
 void Cleanup();
+
+// ---- DirectWrite 文字渲染（替代 GDI，超清晰字体） ----
+extern ID2D1Factory*       g_pD2DFactory;
+extern IDWriteFactory*     g_pDWriteFactory;
+extern IDWriteTextFormat*  g_pTextFormatHeader;  // Segoe UI 12pt Bold
+extern IDWriteTextFormat*  g_pTextFormatNormal;  // Segoe UI 9pt Normal
+
+// 缓存的列表条目数据，供 DirectWrite 自定义绘制使用
+struct ListItemDisplay {
+    std::wstring displayName;
+    std::wstring duration;
+    std::wstring percent;
+    std::wstring status;
+    int iconIndex = -1;
+};
+extern std::vector<ListItemDisplay> g_listItemDisplay;
+
+// 初始化 DirectWrite（在 Initialize 中调用），返回 true 表示成功
+bool InitDirectWrite();
+
+// 清理 DirectWrite 资源，恢复子类化窗口过程
+void CleanupDirectWrite();
 
 } // namespace PanelUI

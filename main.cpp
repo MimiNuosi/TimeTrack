@@ -91,7 +91,21 @@ static WindowMonitor*   g_windowMonitor = nullptr;
 static IdleDetector*    g_idleDetector  = nullptr;
 static TrayManager*     g_trayManager   = nullptr;
 static AppNameResolver* g_nameResolver  = nullptr;
-static LONG             g_exStyle      = 0;     // 窗口扩展样式（创建时锁定，显示前复用）
+static LONG_PTR          g_exStyle      = 0;     // 窗口扩展样式（创建时锁定，显示前复用）
+
+// ============================================================================
+// UI 颜色常量（浅色主题）
+// ============================================================================
+static const COLORREF CLR_BG         = RGB(243, 243, 243);  // #F3F3F3 窗口背景
+static const COLORREF CLR_WHITE      = RGB(255, 255, 255);  // #FFFFFF ListView 背景
+static const COLORREF CLR_TEXT       = RGB( 26,  26,  26);  // #1A1A1A 深灰文字
+static const COLORREF CLR_SEL_BG     = RGB(  0, 120, 215);  // 选中行蓝底
+static const COLORREF CLR_SEL_TEXT   = RGB(255, 255, 255);  // 选中行白字
+
+// 字体与画刷（WM_CREATE 创建，WM_DESTROY 释放）
+static HFONT   g_hFontHeader  = nullptr;  // 12pt bold（标题栏用）
+static HFONT   g_hFontNormal  = nullptr;  // 9pt（ListView / 按钮用）
+static HBRUSH  g_hBrushBg     = nullptr;  // 窗口背景画刷
 
 // ============================================================================
 // 辅助函数声明
@@ -333,10 +347,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         t_cout << "[WM_CREATE] Initializing modules...\n";
 
-        // 0. 创建字体（Segoe UI 9pt）
-        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        // 0. 创建字体（Segoe UI Variable / Segoe UI）
+        // 12pt bold — 标题栏
+        g_hFontHeader = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable");
+        if (!g_hFontHeader) {
+            g_hFontHeader = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        }
+        // 9pt regular — ListView / 按钮
+        g_hFontNormal = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable");
+        if (!g_hFontNormal) {
+            g_hFontNormal = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        }
+        // 背景画刷已由 WinMain 预先创建
 
         // 1. 数据存储
         g_dataStore = new DataStore();
@@ -419,7 +449,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetTimer(hwnd, TIMER_POLLING, intervalMs, nullptr);
 
         // ---- Phase 4: 创建面板 UI ----
-        PanelUI::Initialize(hwnd, g_hInst, hFont);
+        PanelUI::Initialize(hwnd, g_hInst, g_hFontHeader, g_hFontNormal);
 
         // 初始加载今天数据
         if (g_engine) {
@@ -497,7 +527,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 t_cout << "[TRAY] Left click - showing panel\n";
                 // 显示前强制加固扩展样式（某些系统操作可能重置 GWL_EXSTYLE）
-                SetWindowLongW(hwnd, GWL_EXSTYLE, g_exStyle);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_exStyle);
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                 // 显示前显式删除任务栏按钮（explorer 可能缓存了旧的窗口状态）
@@ -535,7 +565,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDM_OPEN_PANEL:
             t_cout << "[MENU] Open Panel\n";
             // 显示前强制加固扩展样式
-            SetWindowLongW(hwnd, GWL_EXSTYLE, g_exStyle);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_exStyle);
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             // 显示前显式删除任务栏按钮
@@ -735,6 +765,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    // ---- 控件着色：静态文本背景透明 + 深灰文字 ----
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = (HDC)wParam;
+        HWND hwndCtl = (HWND)lParam;
+        int ctlId = GetDlgCtrlID(hwndCtl);
+
+        // 标题栏（IDC_HEADER=2000）用自定义画刷 + 深灰文字
+        if (ctlId == IDC_HEADER) {
+            SetTextColor(hdc, CLR_TEXT);
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)g_hBrushBg;
+        }
+        // 其他静态文本：透明背景 + 深灰文字
+        SetTextColor(hdc, CLR_TEXT);
+        SetBkMode(hdc, TRANSPARENT);
+        return (LRESULT)g_hBrushBg;
+    }
+
+    // ---- 按钮着色：保持系统原生渲染 ----
+    case WM_CTLCOLORBTN:
+        // 返回 NULL 让系统使用视觉样式渲染按钮
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+
+    // ---- 限制窗口最小尺寸 500x350 ----
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = 500;
+        mmi->ptMinTrackSize.y = 350;
+        return 0;
+    }
+
     // ---- 窗口销毁 → 完整退出流程 ----
     case WM_DESTROY:
     {
@@ -783,6 +846,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         delete g_nameResolver;  g_nameResolver  = nullptr;
 
         // 注：SingleInstance mutex 在 WinMain 中 si 析构时自动释放
+
+        // 6. 释放字体和画刷
+        if (g_hFontHeader) { DeleteObject(g_hFontHeader); g_hFontHeader = nullptr; }
+        if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = nullptr; }
+        if (g_hBrushBg)    { DeleteObject(g_hBrushBg);    g_hBrushBg    = nullptr; }
 
         t_cout << "[DESTROY] === Cleanup complete. Goodbye! ===\n";
         PostQuitMessage(0);
@@ -871,6 +939,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     t_cout << "  Settings (live apply) + Data retention\n";
     t_cout << "============================================\n\n";
 
+    // ---- 预先创建背景画刷（RegisterClassEx 需要） ----
+    g_hBrushBg = CreateSolidBrush(CLR_BG);
+
     // ---- 注册窗口类 ----
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(WNDCLASSEXW);
@@ -878,7 +949,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.hInstance     = hInstance;
     wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_TIMETRACK));
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = g_hBrushBg;
     wc.lpszClassName = MAIN_WINDOW_CLASS;
     wc.hIconSm       = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_TIMETRACK));
 
@@ -908,10 +979,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // WS_EX_APPWINDOW:   某些 DPI/主题场景下系统可能隐式设置（explorer 据此显示任务栏按钮）
     // WS_EX_WINDOWEDGE:  3D 边框样式，某些场景触发任务栏策略
     // WS_EX_TOOLWINDOW:  工具窗口标识（不在任务栏/Alt+Tab 中显示）
-    g_exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    g_exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     g_exStyle &= ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE);
     g_exStyle |= WS_EX_TOOLWINDOW;
-    SetWindowLongW(hwnd, GWL_EXSTYLE, g_exStyle);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_exStyle);
 
     // SWP_FRAMECHANGED:  强制系统重新评估窗口边框/任务栏策略（立即生效）
     // SWP_HIDEWINDOW:    确保初始状态为隐藏
