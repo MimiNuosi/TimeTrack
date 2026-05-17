@@ -51,6 +51,7 @@ ID2D1Factory*       g_pD2DFactory         = nullptr;
 IDWriteFactory*     g_pDWriteFactory      = nullptr;
 IDWriteTextFormat*  g_pTextFormatHeader   = nullptr;
 IDWriteTextFormat*  g_pTextFormatNormal   = nullptr;
+IDWriteTextFormat*  g_pTextFormatItem     = nullptr; // Segoe UI Variable 10pt
 
 // 缓存的列表条目绘制数据（与 g_displayedAppPaths 一一对应）
 std::vector<ListItemDisplay> g_listItemDisplay;
@@ -67,10 +68,18 @@ static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg,
                                             WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg,
                                               WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg,
+                                            WPARAM wParam, LPARAM lParam);
+
+// 按钮子类化状态（每个按钮独立跟踪 hover/原始窗口过程）
+static std::map<HWND, WNDPROC> g_btnOrigProc;
+static std::map<HWND, bool>    g_btnHover;
+static std::map<HWND, bool>    g_btnTracking;
 
 // DWrite 字号（通过 CreateTextFormat 传递 DIP 值, 1 DIP = 1/96 inch）
-static const FLOAT HEADER_FONT_SIZE_DIP = 16.0f;  // 等价于 12pt
-static const FLOAT NORMAL_FONT_SIZE_DIP = 12.0f;  // 等价于 9pt
+static const FLOAT HEADER_FONT_SIZE_DIP = 16.0f;   // 等价于 12pt
+static const FLOAT NORMAL_FONT_SIZE_DIP = 12.0f;   // 等价于 9pt
+static const FLOAT ITEM_FONT_SIZE_DIP   = 13.333f; // 等价于 10pt (10×96/72)
 
 // 浅色主题颜色常量
 static const COLORREF CLR_LIST_BG    = RGB(255, 255, 255);  // ListView 背景白
@@ -100,7 +109,7 @@ static const int COL_APP_MIN_WIDTH = 120;
 static const int BTN_W = 100;
 
 // 图标尺寸
-static const int ICON_SIZE = 16;  // 小图标 16×16 像素
+static const int ICON_SIZE = 20;  // Win11 图标 20×20 像素
 static const int BTN_H = 28;
 static const int MARGIN = 5;
 static const int HEADER_H = 28;
@@ -298,6 +307,19 @@ void Initialize(HWND hwndParent, HINSTANCE hInst,
     g_pfnOrigListViewProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(hListView, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(ListViewSubclassProc)));
+
+    // ---- 子类化底部按钮：Win11 风格 D2D 绘制 ----
+    // 仅对 4 个底部操作按钮，不包括（由 STATIC 绘制的）头部按钮
+    HWND bottomBtns[] = { hBtnRefresh, hBtnIgnore, hBtnSettings, hBtnClose };
+    for (HWND hBtn : bottomBtns) {
+        if (hBtn && IsWindow(hBtn)) {
+            g_btnOrigProc[hBtn] = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(hBtn, GWLP_WNDPROC,
+                                  reinterpret_cast<LONG_PTR>(ButtonSubclassProc)));
+            g_btnHover[hBtn]    = false;
+            g_btnTracking[hBtn] = false;
+        }
+    }
 }
 
 // ============================================================================
@@ -444,11 +466,30 @@ bool InitDirectWrite() {
         return false;
     }
 
+    // Win11 列表项文本格式：Segoe UI Variable Normal 13.333 DIP (~10pt)
+    hr = g_pDWriteFactory->CreateTextFormat(
+        L"Segoe UI Variable", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        ITEM_FONT_SIZE_DIP,
+        L"en-us",
+        &g_pTextFormatItem);
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"[PanelUI] CreateTextFormat(item) failed\n");
+        // 不致命 — 回退到 g_pTextFormatNormal
+        g_pTextFormatItem = nullptr;
+    }
+
     // 设置对齐方式
     g_pTextFormatHeader->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     g_pTextFormatHeader->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     g_pTextFormatNormal->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     g_pTextFormatNormal->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (g_pTextFormatItem) {
+        g_pTextFormatItem->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_pTextFormatItem->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
 
     OutputDebugStringW(L"[PanelUI] DirectWrite initialized successfully\n");
     return true;
@@ -470,7 +511,18 @@ void CleanupDirectWrite() {
     g_pfnOrigHeaderProc = nullptr;
     g_pfnOrigListViewProc = nullptr;
 
+    // 恢复子类化的按钮窗口过程
+    for (auto& pair : g_btnOrigProc) {
+        if (IsWindow(pair.first)) {
+            SetWindowLongPtrW(pair.first, GWLP_WNDPROC, (LONG_PTR)pair.second);
+        }
+    }
+    g_btnOrigProc.clear();
+    g_btnHover.clear();
+    g_btnTracking.clear();
+
     // 释放 DirectWrite 文本格式
+    SAFE_RELEASE_DW(g_pTextFormatItem);
     SAFE_RELEASE_DW(g_pTextFormatNormal);
     SAFE_RELEASE_DW(g_pTextFormatHeader);
     // 释放 DWrite 工厂
@@ -526,15 +578,41 @@ static LRESULT CALLBACK HeaderSubclassProc(HWND hwnd, UINT msg,
                 // 避免上一帧残留的 GDI 文本透过 DWrite 文字层显示
                 pRT->Clear(D2D1::ColorF(0xF3F3F3));
 
+                // ---- Win11 风格卡片背景：白色圆角矩形，80% 不透明度，4px 内边距 ----
+                const float CARD_RADIUS = 8.0f;
+                const float CARD_PAD    = 4.0f;
+                FLOAT cardW = static_cast<FLOAT>(rc.right - rc.left) - 2 * CARD_PAD;
+                FLOAT cardH = static_cast<FLOAT>(rc.bottom - rc.top) - 2 * CARD_PAD;
+                if (cardW > CARD_RADIUS * 2 && cardH > CARD_RADIUS * 2) {
+                    D2D1_ROUNDED_RECT cardRR = D2D1::RoundedRect(
+                        D2D1::RectF(CARD_PAD, CARD_PAD,
+                                    CARD_PAD + cardW, CARD_PAD + cardH),
+                        CARD_RADIUS, CARD_RADIUS);
+                    ID2D1RoundedRectangleGeometry* pCardGeom = nullptr;
+                    HRESULT hrGeom = g_pD2DFactory->CreateRoundedRectangleGeometry(
+                        cardRR, &pCardGeom);
+                    if (SUCCEEDED(hrGeom) && pCardGeom) {
+                        ID2D1SolidColorBrush* pCardBrush = nullptr;
+                        HRESULT hrBr = pRT->CreateSolidColorBrush(
+                            D2D1::ColorF(0xFFFFFF, 0.8f), &pCardBrush);
+                        if (SUCCEEDED(hrBr) && pCardBrush) {
+                            pRT->FillGeometry(pCardGeom, pCardBrush);
+                            pCardBrush->Release();
+                        }
+                        pCardGeom->Release();
+                    }
+                }
+
                 // 创建文字笔刷（深灰 #1A1A1A = RGB(26,26,26)）
                 ID2D1SolidColorBrush* pBrush = nullptr;
                 hr = pRT->CreateSolidColorBrush(
                     D2D1::ColorF(0x1A1A1A), &pBrush);
                 if (SUCCEEDED(hr) && pBrush) {
+                    // 文本区域：卡片内部，留 4px 内边距
                     D2D1_RECT_F textRect = {
-                        0.0f, 0.0f,
-                        static_cast<FLOAT>(rc.right - rc.left),
-                        static_cast<FLOAT>(rc.bottom - rc.top)
+                        CARD_PAD + 2.0f, CARD_PAD,
+                        static_cast<FLOAT>(rc.right - rc.left) - CARD_PAD,
+                        static_cast<FLOAT>(rc.bottom - rc.top) - CARD_PAD
                     };
 
                     // 使用 DirectWrite 绘制文本（ClearType 抗锯齿）
@@ -650,173 +728,54 @@ static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg,
             goto EndListViewDraw;
         }
 
-        // ---- 获取列宽 ----
-        int colWidths[4];
-        colWidths[0] = ListView_GetColumnWidth(hwnd, 0);
-        colWidths[1] = ListView_GetColumnWidth(hwnd, 1);
-        colWidths[2] = ListView_GetColumnWidth(hwnd, 2);
-        colWidths[3] = ListView_GetColumnWidth(hwnd, 3);
-        int totalColW = colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3];
-
-        // ---- 获取项高度 ----
-        int itemH = 20; // 默认
-        if (itemCount > 0) {
-            RECT rcItem = {};
-            if (SendMessageW(hwnd, LVM_GETITEMRECT, 0, (LPARAM)&rcItem)) {
-                itemH = rcItem.bottom - rcItem.top;
-            }
-        }
-
-        // ---- 获取选中项 ----
+        // ---- 循环绘制所有可见行的 Win11 风格条目 ----
         int selIdx = ListView_GetNextItem(hwnd, -1, LVNI_SELECTED);
 
-        // ---- 创建选中高亮笔刷 ----
-        ID2D1SolidColorBrush* pBrushText = nullptr;
-        hr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x1A1A1A), &pBrushText);
-        if (FAILED(hr)) goto EndListViewDraw;
+        for (int idx = topIdx; idx < bottomIdx && idx < (int)g_listItemDisplay.size(); ++idx) {
+            RECT rcItem = {};
+            if (SendMessageW(hwnd, LVM_GETITEMRECT, (WPARAM)idx, (LPARAM)&rcItem)) {
+                bool isSel = (idx == selIdx);
 
-        ID2D1SolidColorBrush* pBrushSel = nullptr;
-        hr = pRT->CreateSolidColorBrush(
-            D2D1::ColorF(0xCCE8FF), // 浅蓝选中背景
-            &pBrushSel);
-        if (FAILED(hr)) { pBrushText->Release(); goto EndListViewDraw; }
+                // 整行宽度（使用 ListView 客户区宽度）
+                RECT rcFull = rcItem;
+                rcFull.left = 0;
+                rcFull.right = rc.right - rc.left;
 
-        ID2D1SolidColorBrush* pBrushSelText = nullptr;
-        hr = pRT->CreateSolidColorBrush(
-            D2D1::ColorF(0x000000), // 选中行文字黑色
-            &pBrushSelText);
-        if (FAILED(hr)) { pBrushText->Release(); pBrushSel->Release(); goto EndListViewDraw; }
-
-        ID2D1SolidColorBrush* pBrushGrid = nullptr;
-        hr = pRT->CreateSolidColorBrush(
-            D2D1::ColorF(0xE0E0E0), // 浅灰网格线
-            &pBrushGrid);
-        if (FAILED(hr)) {
-            pBrushText->Release(); pBrushSel->Release(); pBrushSelText->Release();
-            goto EndListViewDraw;
-        }
-
-        // ---- 绘制可见项 ----
-        for (int i = topIdx; i < bottomIdx && i < (int)g_listItemDisplay.size(); ++i) {
-            int y = (i - topIdx) * itemH;
-            const auto& item = g_listItemDisplay[i];
-
-            // 每行背景
-            D2D1_RECT_F rowRect = { 0.0f, (FLOAT)y, (FLOAT)totalColW, (FLOAT)(y + itemH) };
-            if (i == selIdx) {
-                pRT->FillRectangle(&rowRect, pBrushSel);
-            } else if (i % 2 == 1) {
-                // 交替行浅灰色（偶数索引为白色，奇数索引为极浅灰）
-                ID2D1SolidColorBrush* pAlt = nullptr;
-                hr = pRT->CreateSolidColorBrush(D2D1::ColorF(0xF5F5F5), &pAlt);
-                if (SUCCEEDED(hr)) {
-                    pRT->FillRectangle(&rowRect, pAlt);
-                    pAlt->Release();
-                }
-            }
-
-            // 第0列：图标 + 应用名称
-            int x = 4; // 左边距
-            int textX = x + 20; // 图标(16px) + 间距 = 20px
-
-            D2D1_RECT_F textRect0 = {
-                (FLOAT)textX, (FLOAT)y + 1.0f,
-                (FLOAT)(textX + colWidths[0] - textX - 4), (FLOAT)(y + itemH - 1)
-            };
-            ID2D1Brush* brush0 = (i == selIdx) ? pBrushSelText : pBrushText;
-            pRT->DrawTextW(
-                item.displayName.c_str(),
-                (UINT32)item.displayName.size(),
-                g_pTextFormatNormal,
-                textRect0,
-                brush0,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-
-            // 第1列：时长（右对齐）
-            int x1 = colWidths[0];
-            D2D1_RECT_F textRect1 = {
-                (FLOAT)(x1 + 4), (FLOAT)y + 1.0f,
-                (FLOAT)(x1 + colWidths[1] - 4), (FLOAT)(y + itemH - 1)
-            };
-            pRT->DrawTextW(
-                item.duration.c_str(),
-                (UINT32)item.duration.size(),
-                g_pTextFormatNormal,
-                textRect1,
-                brush0,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-
-            // 第2列：百分比（右对齐）
-            int x2 = x1 + colWidths[1];
-            D2D1_RECT_F textRect2 = {
-                (FLOAT)(x2 + 4), (FLOAT)y + 1.0f,
-                (FLOAT)(x2 + colWidths[2] - 4), (FLOAT)(y + itemH - 1)
-            };
-            pRT->DrawTextW(
-                item.percent.c_str(),
-                (UINT32)item.percent.size(),
-                g_pTextFormatNormal,
-                textRect2,
-                brush0,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-
-            // 第3列：状态（左对齐）
-            int x3 = x2 + colWidths[2];
-            if (colWidths[3] > 0 && !item.status.empty()) {
-                D2D1_RECT_F textRect3 = {
-                    (FLOAT)(x3 + 4), (FLOAT)y + 1.0f,
-                    (FLOAT)(x3 + colWidths[3] - 4), (FLOAT)(y + itemH - 1)
-                };
-                pRT->DrawTextW(
-                    item.status.c_str(),
-                    (UINT32)item.status.size(),
-                    g_pTextFormatNormal,
-                    textRect3,
-                    brush0,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                // 绘制 Win11 风格行
+                DrawListViewItem_Win11(pRT, rcFull,
+                                       g_listItemDisplay[idx], isSel);
             }
         }
 
-        // ---- 绘制水平网格线 ----
-        int visibleCount = min(bottomIdx - topIdx, (int)g_listItemDisplay.size() - topIdx);
-        for (int i = 0; i <= visibleCount; ++i) {
-            int y = i * itemH;
-            D2D1_POINT_2F pt1 = { 0.0f, (FLOAT)y };
-            D2D1_POINT_2F pt2 = { (FLOAT)totalColW, (FLOAT)y };
-            pRT->DrawLine(pt1, pt2, pBrushGrid, 0.5f);
-        }
-
-        // ---- 释放笔刷 ----
-        pBrushGrid->Release();
-        pBrushSelText->Release();
-        pBrushSel->Release();
-        pBrushText->Release();
-
-EndListViewDraw:
         // 提交 D2D 绘制
         hr = pRT->EndDraw();
         if (FAILED(hr)) {
             OutputDebugStringW(L"[PanelUI] ListView D2D EndDraw failed\n");
-            // EndPaint 已调用，不能再次触发原始 WM_PAINT（导致双重绘制）
             pRT->Release();
             EndPaint(hwnd, &ps);
             return 0;
         }
         pRT->Release();
 
-        // ---- D2D 绘制完成后，使用 GDI 绘制图标（在 HDC 上层叠） ----
+        // ---- D2D 绘制完成后，使用 GDI 循环绘制所有可见行的图标 ----
         HIMAGELIST himl = AppIconCache::GetImageList();
-        if (himl && itemCount > 0 && itemCount == (int)g_listItemDisplay.size()) {
-            for (int i = topIdx; i < bottomIdx && i < (int)g_listItemDisplay.size(); ++i) {
-                int iconIdx = g_listItemDisplay[i].iconIndex;
+        if (himl) {
+            for (int idx = topIdx; idx < bottomIdx && idx < (int)g_listItemDisplay.size(); ++idx) {
+                int iconIdx = g_listItemDisplay[idx].iconIndex;
                 if (iconIdx >= 0) {
-                    int y = (i - topIdx) * itemH;
-                    int iconY = y + (itemH - ICON_SIZE) / 2;
-                    ImageList_Draw(himl, iconIdx, hdc, 4, iconY, ILD_TRANSPARENT);
+                    RECT rcIconItem = {};
+                    if (SendMessageW(hwnd, LVM_GETITEMRECT,
+                                     (WPARAM)idx, (LPARAM)&rcIconItem)) {
+                        int iconItemH = rcIconItem.bottom - rcIconItem.top;
+                        int iconY = rcIconItem.top + (iconItemH - ICON_SIZE) / 2;
+                        ImageList_Draw(himl, iconIdx, hdc,
+                                       12, iconY, ILD_TRANSPARENT);
+                    }
                 }
             }
         }
 
+    EndListViewDraw:
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -835,6 +794,377 @@ EndListViewDraw:
     }
 
     return CallWindowProcW(g_pfnOrigListViewProc, hwnd, msg, wParam, lParam);
+}
+
+// ============================================================================
+// ButtonSubclassProc — 底部按钮的子类化窗口过程
+// 使用 Direct2D 绘制 Win11 风格圆角按钮（替代 GDI BS_FLAT）
+// 回退策略：D2D 不可用 → 调用原始窗口过程（原始 GDI 按钮外观）
+// 点击/焦点/键盘行为 → 全部转发给原始窗口过程
+// ============================================================================
+
+// ============================================================================
+// DrawButtonD2D_Content — D2D 绘制按钮内容（共享：WM_PAINT / WM_PRINTCLIENT）
+// pRT:  已 BeginDraw 的渲染目标
+// hwnd: 按钮窗口句柄（用于读取文本、状态）
+// rc:   按钮客户区矩形
+// ============================================================================
+static void DrawButtonD2D_Content(ID2D1RenderTarget* pRT, HWND hwnd, const RECT& rc) {
+    // 清空背景（父窗口背景色 #F3F3F3，填充按钮圆角之外的区域）
+    pRT->Clear(D2D1::ColorF(0xF3F3F3));
+
+    FLOAT x = (FLOAT)rc.left;
+    FLOAT y = (FLOAT)rc.top;
+    FLOAT w = (FLOAT)(rc.right - rc.left);
+    FLOAT h = (FLOAT)(rc.bottom - rc.top);
+
+    // ---- 确定按钮状态（normal / hover / pressed） ----
+    bool isHover   = g_btnHover.count(hwnd) ? g_btnHover[hwnd] : false;
+    bool isPressed = (SendMessageW(hwnd, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
+
+    D2D1_COLOR_F fillCol, borderCol;
+    if (isPressed) {
+        fillCol   = D2D1::ColorF(0xCCCCCC);
+        borderCol = D2D1::ColorF(0xB0B0B0);
+    } else if (isHover) {
+        fillCol   = D2D1::ColorF(0xE0E0E0);
+        borderCol = D2D1::ColorF(0xB0B0B0);
+    } else {
+        fillCol   = D2D1::ColorF(0xF5F5F5);
+        borderCol = D2D1::ColorF(0xD0D0D0);
+    }
+
+    const float BTN_RADIUS = 4.0f;
+
+    // ---- 圆角矩形背景 + 1px 边框 ----
+    D2D1_ROUNDED_RECT btnRR = D2D1::RoundedRect(
+        D2D1::RectF(x + 1.0f, y + 1.0f, x + w - 1.0f, y + h - 1.0f),
+        BTN_RADIUS, BTN_RADIUS);
+
+    ID2D1RoundedRectangleGeometry* pGeom = nullptr;
+    HRESULT hr = g_pD2DFactory->CreateRoundedRectangleGeometry(btnRR, &pGeom);
+    if (SUCCEEDED(hr) && pGeom) {
+        // 填充
+        ID2D1SolidColorBrush* pFillBr = nullptr;
+        hr = pRT->CreateSolidColorBrush(fillCol, &pFillBr);
+        if (SUCCEEDED(hr) && pFillBr) {
+            pRT->FillGeometry(pGeom, pFillBr);
+            pFillBr->Release();
+        }
+        // 1px 描边边框
+        ID2D1SolidColorBrush* pBorderBr = nullptr;
+        hr = pRT->CreateSolidColorBrush(borderCol, &pBorderBr);
+        if (SUCCEEDED(hr) && pBorderBr) {
+            pRT->DrawGeometry(pGeom, pBorderBr, 1.0f);
+            pBorderBr->Release();
+        }
+        pGeom->Release();
+    }
+
+    // ---- 按钮文本（水平居中，垂直居中） ----
+    int textLen = GetWindowTextLengthW(hwnd);
+    if (textLen > 0) {
+        std::wstring text(textLen, L'\0');
+        GetWindowTextW(hwnd, &text[0], textLen + 1);
+
+        // 临时切换文本对齐为居中（同一线程同步绘制，安全）
+        g_pTextFormatNormal->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_pTextFormatNormal->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        ID2D1SolidColorBrush* pTextBr = nullptr;
+        hr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x1A1A1A), &pTextBr);
+        if (SUCCEEDED(hr) && pTextBr) {
+            // 按下状态：文本偏移 +1px 模拟 Win11 "推入"效果
+            FLOAT offX = isPressed ? 1.0f : 0.0f;
+            FLOAT offY = isPressed ? 1.0f : 0.0f;
+            D2D1_RECT_F textRect = {
+                x + 4.0f + offX, y + 2.0f + offY,
+                x + w - 4.0f + offX, y + h - 2.0f + offY
+            };
+            pRT->DrawTextW(
+                text.c_str(), (UINT32)text.size(),
+                g_pTextFormatNormal, textRect,
+                pTextBr,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            pTextBr->Release();
+        }
+
+        // 恢复原始对齐
+        g_pTextFormatNormal->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_pTextFormatNormal->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+}
+
+// ============================================================================
+// ButtonSubclassProc — 底部按钮的子类化窗口过程
+// 使用 Direct2D 绘制 Win11 风格圆角按钮（替代 GDI BS_FLAT）
+// 回退策略：D2D 不可用 → 调用原始窗口过程（原始 GDI 按钮外观）
+// 点击/焦点/键盘行为 → 全部转发给原始窗口过程
+// ============================================================================
+
+static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg,
+                                            WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        // D2D 未就绪 → 回退到原始 GDI 按钮
+        if (!g_pD2DFactory || !g_pTextFormatNormal) break;
+
+        PAINTSTRUCT ps = {};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (!hdc) return 0;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        D2D1_RENDER_TARGET_PROPERTIES props = {};
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
+        ID2D1DCRenderTarget* pRT = nullptr;
+        HRESULT hr = g_pD2DFactory->CreateDCRenderTarget(&props, &pRT);
+        if (FAILED(hr)) { EndPaint(hwnd, &ps); return 0; }
+
+        hr = pRT->BindDC(hdc, &rc);
+        if (FAILED(hr)) { pRT->Release(); EndPaint(hwnd, &ps); return 0; }
+
+        pRT->BeginDraw();
+        DrawButtonD2D_Content(pRT, hwnd, rc);
+
+        hr = pRT->EndDraw();
+        if (FAILED(hr)) {
+            OutputDebugStringW(L"[PanelUI] Button D2D EndDraw failed\n");
+            pRT->Release();
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        pRT->Release();
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_PRINTCLIENT: {
+        // WM_PRINTCLIENT 由按钮原始过程在状态变更时发送，
+        // 若不拦截会通过 CallWindowProcW 触发 GDI 绘制 → 导致 GDI 文本闪烁
+        if (!g_pD2DFactory || !g_pTextFormatNormal) break;
+        HDC hdc = (HDC)wParam;
+        if (!hdc) return 0;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        D2D1_RENDER_TARGET_PROPERTIES props = {};
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
+        ID2D1DCRenderTarget* pRT = nullptr;
+        HRESULT hr = g_pD2DFactory->CreateDCRenderTarget(&props, &pRT);
+        if (FAILED(hr)) return 0;
+
+        hr = pRT->BindDC(hdc, &rc);
+        if (FAILED(hr)) { pRT->Release(); return 0; }
+
+        pRT->BeginDraw();
+        DrawButtonD2D_Content(pRT, hwnd, rc);
+        pRT->EndDraw();
+        pRT->Release();
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        bool wasHover = g_btnHover.count(hwnd) ? g_btnHover[hwnd] : false;
+        g_btnHover[hwnd] = true;
+        // 首次 hover → 请求 WM_MOUSELEAVE 通知
+        if (!g_btnTracking.count(hwnd) || !g_btnTracking[hwnd]) {
+            TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            g_btnTracking[hwnd] = true;
+        }
+        if (!wasHover) InvalidateRect(hwnd, nullptr, FALSE);
+        break; // 同时传递给原始窗口过程（BS_FLAT 对此无特殊行为）
+    }
+
+    case WM_MOUSELEAVE: {
+        g_btnHover[hwnd]    = false;
+        g_btnTracking[hwnd] = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0; // 已处理，不传递给原始窗口过程
+    }
+
+    case WM_ERASEBKGND:
+        // 完全由 WM_PAINT 处理绘制，禁止擦除（避免闪烁）
+        return 1;
+
+    case WM_DESTROY: {
+        // 清理该按钮的状态映射
+        g_btnOrigProc.erase(hwnd);
+        g_btnHover.erase(hwnd);
+        g_btnTracking.erase(hwnd);
+        break;
+    }
+
+    default:
+        // 安全守卫：绝不将 WM_PAINT 转发给原始按钮过程（避免 GDI 双重绘制）
+        if (msg == WM_PAINT) return 0;
+        break;
+    }
+
+    // 转发给原始窗口过程（保留按钮的点击/焦点/键盘/通知行为）
+    auto it = g_btnOrigProc.find(hwnd);
+    if (it != g_btnOrigProc.end()) {
+        return CallWindowProcW(it->second, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ============================================================================
+// DrawListViewItem_Win11 — 使用 Direct2D 绘制单个 Win11 File Explorer 风格行（原型）
+// pRT:       处于 BeginDraw 状态的 D2D 渲染目标
+// rc:        该行的客户区矩形（LEFT/TOP 为行左/顶部，整个行宽）
+// item:      该行的数据（displayName, duration, percent, status, iconIndex）
+// isSelected: 选中状态（影响背景色 #E8F0FE）
+// 注意：应用图标由调用方在 EndDraw 之后通过 GDI ImageList_Draw 绘制
+// ============================================================================
+
+void DrawListViewItem_Win11(ID2D1RenderTarget* pRT, const RECT& rc,
+                            const ListItemDisplay& item, bool isSelected) {
+    // ---- 布局常量 ----
+    const float RADIUS        = 4.0f;   // 圆角半径
+    const int   LEFT_MARGIN   = 16;     // 左边距
+    const int   ICON_SIZE_PX  = 20;     // 图标占位宽度
+    const int   ICON_GAP      = 8;      // 图标与文字间距
+    const int   DUR_WIDTH     = 80;     // 时长列宽
+    const int   PCT_WIDTH     = 55;     // 百分比列宽
+    const int   STATUS_WIDTH  = 80;     // 状态标识区域宽度
+    const float DOT_RADIUS    = 5.0f;   // 绿点半径 (10px 直径)
+
+    FLOAT x = (FLOAT)rc.left;
+    FLOAT y = (FLOAT)rc.top;
+    FLOAT w = (FLOAT)(rc.right - rc.left);
+    FLOAT h = (FLOAT)(rc.bottom - rc.top);
+
+    // 10pt 文本格式回退：如果 g_pTextFormatItem 未创建则使用 g_pTextFormatNormal
+    IDWriteTextFormat* pFmtItem = g_pTextFormatItem ? g_pTextFormatItem
+                                                    : g_pTextFormatNormal;
+
+    // ---- 1. 圆角矩形背景（仅选中时） ----
+    if (isSelected) {
+        ID2D1RoundedRectangleGeometry* pGeom = nullptr;
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+            D2D1::RectF(x, y + 1.0f, x + w, y + h - 1.0f), RADIUS, RADIUS);
+        HRESULT hrGeom = g_pD2DFactory->CreateRoundedRectangleGeometry(rr, &pGeom);
+        if (SUCCEEDED(hrGeom) && pGeom) {
+            ID2D1SolidColorBrush* pBgBrush = nullptr;
+            HRESULT hrBr = pRT->CreateSolidColorBrush(
+                D2D1::ColorF(0xE8F0FE), &pBgBrush);
+            if (SUCCEEDED(hrBr) && pBgBrush) {
+                pRT->FillGeometry(pGeom, pBgBrush);
+                pBgBrush->Release();
+            }
+            pGeom->Release();
+        }
+    }
+
+    // ---- 2. 应用名称（图标右侧，左对齐） ----
+    FLOAT textX = x + LEFT_MARGIN + ICON_SIZE_PX + ICON_GAP; // 16+20+8 = 44
+
+    // 计算右侧元素总占位宽度
+    FLOAT rightAreaW = DUR_WIDTH + PCT_WIDTH + STATUS_WIDTH;
+    FLOAT textMaxW = w - textX - rightAreaW - LEFT_MARGIN;
+    if (textMaxW < 60.0f) textMaxW = 60.0f;
+
+    // 文字笔刷（#1A1A1A 深灰）
+    ID2D1SolidColorBrush* pNameBrush = nullptr;
+    HRESULT hrNameBr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x1A1A1A), &pNameBrush);
+
+    D2D1_RECT_F nameRect = { textX, y + 1.0f, textX + textMaxW, y + h - 1.0f };
+    if (SUCCEEDED(hrNameBr) && pNameBrush && !item.displayName.empty()) {
+        pRT->DrawTextW(
+            item.displayName.c_str(),
+            (UINT32)item.displayName.size(),
+            pFmtItem,
+            nameRect,
+            pNameBrush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    }
+    if (pNameBrush) pNameBrush->Release();
+
+    // ---- 3. 时长（右侧，颜色 #555555） ----
+    FLOAT durX = x + w - STATUS_WIDTH - PCT_WIDTH - DUR_WIDTH - LEFT_MARGIN;
+
+    ID2D1SolidColorBrush* pDurBrush = nullptr;
+    HRESULT hrDurBr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x555555), &pDurBrush);
+
+    D2D1_RECT_F durRect = { durX, y + 1.0f, durX + DUR_WIDTH - 4, y + h - 1.0f };
+    if (SUCCEEDED(hrDurBr) && pDurBrush && !item.duration.empty()) {
+        pRT->DrawTextW(
+            item.duration.c_str(),
+            (UINT32)item.duration.size(),
+            pFmtItem,
+            durRect,
+            pDurBrush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    }
+    if (pDurBrush) pDurBrush->Release();
+
+    // ---- 4. 百分比（时长右侧，颜色 #888888） ----
+    FLOAT pctX = durX + DUR_WIDTH;
+    ID2D1SolidColorBrush* pPctBrush = nullptr;
+    HRESULT hrPctBr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x888888), &pPctBrush);
+
+    D2D1_RECT_F pctRect = { pctX, y + 1.0f, pctX + PCT_WIDTH - 4, y + h - 1.0f };
+    if (SUCCEEDED(hrPctBr) && pPctBrush && !item.percent.empty()) {
+        pRT->DrawTextW(
+            item.percent.c_str(),
+            (UINT32)item.percent.size(),
+            pFmtItem,
+            pctRect,
+            pPctBrush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    }
+    if (pPctBrush) pPctBrush->Release();
+
+    // ---- 5. 状态徽标（绿点 + "Active" 文字，仅当 status 包含 "ACTIVE"） ----
+    const bool hasDot =
+        (item.status.find(L"ACTIVE") != std::wstring::npos ||
+         item.status.find(L"Active") != std::wstring::npos);
+
+    if (hasDot) {
+        FLOAT badgeX = pctX + PCT_WIDTH + 8;
+        FLOAT dotCenterX = badgeX + DOT_RADIUS;
+        FLOAT dotCenterY = y + h / 2.0f;
+
+        // 绿色小圆点（#4CAF50）
+        ID2D1SolidColorBrush* pDotBrush = nullptr;
+        HRESULT hrDotBr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x4CAF50), &pDotBrush);
+        if (SUCCEEDED(hrDotBr) && pDotBrush) {
+            D2D1_ELLIPSE dot = { { dotCenterX, dotCenterY }, DOT_RADIUS, DOT_RADIUS };
+            pRT->FillEllipse(&dot, pDotBrush);
+            pDotBrush->Release();
+        }
+
+        // "Active" 文字（#4CAF50 同色）
+        FLOAT activeTextX = dotCenterX + DOT_RADIUS + 6;
+        ID2D1SolidColorBrush* pActiveBrush = nullptr;
+        HRESULT hrActBr = pRT->CreateSolidColorBrush(D2D1::ColorF(0x4CAF50), &pActiveBrush);
+        if (SUCCEEDED(hrActBr) && pActiveBrush) {
+            std::wstring activeStr = L"Active";
+            D2D1_RECT_F activeRect = {
+                activeTextX, y + 1.0f,
+                activeTextX + STATUS_WIDTH - (activeTextX - badgeX) - 4,
+                y + h - 1.0f
+            };
+            pRT->DrawTextW(
+                activeStr.c_str(), (UINT32)activeStr.size(),
+                pFmtItem,
+                activeRect,
+                pActiveBrush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            pActiveBrush->Release();
+        }
+    }
 }
 
 // ============================================================================
