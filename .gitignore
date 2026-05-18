@@ -20,3 +20,4 @@ timetrack_data.json
 # 忽略指定文件
 CLAUDE.md
 需求文档.h
+.claude/
