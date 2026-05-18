@@ -236,10 +236,13 @@ void IncrementDate(std::string& date, int deltaDays) {
     SystemTimeToFileTime(&st, &ft);
 
     // Add delta (in 100-nanosecond intervals)
+    // Use signed arithmetic to avoid unsigned wraparound for negative deltas
     ULARGE_INTEGER uli;
     uli.LowPart = ft.dwLowDateTime;
     uli.HighPart = ft.dwHighDateTime;
-    uli.QuadPart += (LONGLONG)deltaDays * 24LL * 3600LL * 10000000LL;
+    LONGLONG ll = static_cast<LONGLONG>(uli.QuadPart);
+    ll += static_cast<LONGLONG>(deltaDays) * 24LL * 3600LL * 10000000LL;
+    uli.QuadPart = static_cast<ULONGLONG>(ll);
 
     ft.dwLowDateTime = uli.LowPart;
     ft.dwHighDateTime = uli.HighPart;
@@ -253,8 +256,6 @@ void IncrementDate(std::string& date, int deltaDays) {
 void NavigateToDate(HWND hwnd, const std::string& date) {
     if (!g_dataStore) return;
 
-    std::string today = PanelUI::g_currentViewDate;
-    // Compare against today
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm lt;
@@ -265,19 +266,34 @@ void NavigateToDate(HWND hwnd, const std::string& date) {
     std::string todayStr(todayBuf);
 
     if (date == todayStr) {
-        // Back to today: resume live mode
+        // Today: resume live mode with fresh data from engine
         PanelUI::SetHistoryMode(false);
         if (g_engine) {
             PanelUI::RefreshFull(g_engine->GetTodayData());
         }
         SetTimer(hwnd, TIMER_REFRESH_UI, 1000, nullptr);
         t_cout << "[NAV] Back to today, live refresh resumed\n";
+    } else if (date > todayStr) {
+        // Future date: force empty list, no DataStore load
+        PanelUI::SetHistoryMode(true);
+        KillTimer(hwnd, TIMER_REFRESH_UI);
+        DailyData emptyData;
+        emptyData.date = date;
+        PanelUI::LoadHistoryData(date, emptyData);
+        t_cout << "[NAV] Future date: " << date << " (no data)\n";
     } else {
-        // History mode: load from DataStore
+        // Past date: load from DataStore, with defensive empty fallback
         PanelUI::SetHistoryMode(true);
         KillTimer(hwnd, TIMER_REFRESH_UI);
         DailyData histData = g_dataStore->LoadDailyData(date);
-        PanelUI::LoadHistoryData(date, histData);
+        if (histData.entries.empty()) {
+            // DataStore returned empty — force clear to avoid stale display
+            DailyData emptyData;
+            emptyData.date = date;
+            PanelUI::LoadHistoryData(date, emptyData);
+        } else {
+            PanelUI::LoadHistoryData(date, histData);
+        }
         t_cout << "[NAV] Viewing history: " << date << " (entries: " << histData.entries.size() << ")\n";
     }
 }
