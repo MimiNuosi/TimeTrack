@@ -16,3 +16,7 @@
 
 # 用户数据（本地运行时生成）
 timetrack_data.json
+
+# 忽略指定文件
+CLAUDE.md
+需求文档.h
