@@ -20,6 +20,9 @@ static const int BTN_W = 85;
 static const int BTN_H = 28;
 static const int BTN_REMOVE_W = 135;  // "Remove Selected" 文字较长，单独宽度
 
+// 对话框背景画刷（轻量浅灰）
+static HBRUSH g_hIgnoreDlgBrush = nullptr;
+
 // ---- 传递给对话框的参数 ----
 struct IgnoreDialogParams {
     IgnoreManager* im;
@@ -123,11 +126,12 @@ void ShowIgnoreListDialog(HWND parent, HINSTANCE hInst,
     // 注册对话框类
     static bool classRegistered = false;
     if (!classRegistered) {
+        if (!g_hIgnoreDlgBrush) g_hIgnoreDlgBrush = CreateSolidBrush(RGB(245, 245, 245));
         WNDCLASSEXW wc = {};
         wc.cbSize        = sizeof(WNDCLASSEXW);
         wc.hInstance     = hInst;
         wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = g_hIgnoreDlgBrush;
         wc.lpszClassName = L"TimeTrack_IgnoreDlg";
         wc.lpfnWndProc   = DefWindowProcW; // 稍后子类化
         RegisterClassExW(&wc);
@@ -208,14 +212,14 @@ void ShowIgnoreListDialog(HWND parent, HINSTANCE hInst,
     // [Remove Selected] — 紧邻 [Close] 左侧，右对齐布局
     int btnRemoveX = DIALOG_W - MARGIN - BTN_W - 8 - BTN_REMOVE_W;
     HWND hBtnRemove = CreateWindowExW(0, L"BUTTON", L"Remove Selected",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
         btnRemoveX, btnY, BTN_REMOVE_W, BTN_H,
         hDlg, (HMENU)IDC_BTN_IGN_REMOVE, hInst, nullptr);
     SendMessageW(hBtnRemove, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     // [Close] — 最右侧
     HWND hBtnClose = CreateWindowExW(0, L"BUTTON", L"Close",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
         DIALOG_W - BTN_W - MARGIN, btnY, BTN_W, BTN_H,
         hDlg, (HMENU)IDC_BTN_IGN_CLOSE, hInst, nullptr);
     SendMessageW(hBtnClose, WM_SETFONT, (WPARAM)hFont, TRUE);

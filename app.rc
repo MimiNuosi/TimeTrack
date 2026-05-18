@@ -11,8 +11,8 @@ CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 
 // ---- 版本信息 ----
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,0
+PRODUCTVERSION  1,1,0,0
 FILEFLAGSMASK   0x3fL
 #ifdef _DEBUG
 FILEFLAGS       0x1L   // VS_FF_DEBUG
@@ -29,12 +29,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "TimeTrack"
             VALUE "FileDescription",  "TimeTrack - Application Usage Tracker"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileVersion", "1.1.0"
             VALUE "InternalName",     "TimeTrack"
             VALUE "LegalCopyright",   "Copyright (C) 2026"
             VALUE "OriginalFilename", "TimeTrack.exe"
             VALUE "ProductName",      "TimeTrack"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion", "1.1.0"
         END
     END
     BLOCK "VarFileInfo"

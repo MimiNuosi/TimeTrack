@@ -20,6 +20,10 @@ static const int TRACKBAR_W = 180;
 static const int EDIT_W = 45;
 static const int LABEL_W = 90;
 
+// 对话框背景画刷（轻量浅灰）
+static COLORREF      g_dlgBgColor = RGB(245, 245, 245);  // 略浅于面板背景
+static HBRUSH        g_hDlgBrush  = nullptr;
+
 // 参数
 struct SettingsDialogParams {
     ConfigManager* cm;
@@ -191,11 +195,12 @@ void ShowSettingsDialog(HWND parent, HINSTANCE hInst,
     // 注册对话框类
     static bool classRegistered = false;
     if (!classRegistered) {
+        if (!g_hDlgBrush) g_hDlgBrush = CreateSolidBrush(g_dlgBgColor);
         WNDCLASSEXW wc = {};
         wc.cbSize        = sizeof(WNDCLASSEXW);
         wc.hInstance     = hInst;
         wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = g_hDlgBrush;
         wc.lpszClassName = L"TimeTrack_SettingsDlg";
         wc.lpfnWndProc   = DefWindowProcW;
         RegisterClassExW(&wc);
@@ -334,14 +339,14 @@ void ShowSettingsDialog(HWND parent, HINSTANCE hInst,
     // [Save] 按钮
     int btnSaveX = DIALOG_W - 2 * BTN_W - MARGIN_L - 8;
     HWND hBtnSave = CreateWindowExW(0, L"BUTTON", L"Save",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON | BS_FLAT,
         btnSaveX, y, BTN_W, BTN_H,
         hDlg, (HMENU)IDC_BTN_SAVE, hInst, nullptr);
     SendMessageW(hBtnSave, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     // [Cancel] 按钮
     HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
         btnSaveX + BTN_W + 8, y, BTN_W, BTN_H,
         hDlg, (HMENU)IDC_BTN_CANCEL, hInst, nullptr);
     SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);

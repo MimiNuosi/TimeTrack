@@ -12,6 +12,7 @@
 
 // Direct2D / DirectWrite 前置声明（避免在头文件中引入完整 d2d1.h/dwrite.h）
 struct ID2D1Factory;
+struct ID2D1RenderTarget;
 struct IDWriteFactory;
 struct IDWriteTextFormat;
 
@@ -90,6 +91,7 @@ extern ID2D1Factory*       g_pD2DFactory;
 extern IDWriteFactory*     g_pDWriteFactory;
 extern IDWriteTextFormat*  g_pTextFormatHeader;  // Segoe UI 12pt Bold
 extern IDWriteTextFormat*  g_pTextFormatNormal;  // Segoe UI 9pt Normal
+extern IDWriteTextFormat*  g_pTextFormatItem;    // Segoe UI Variable 10pt（Win11 原型）
 
 // 缓存的列表条目数据，供 DirectWrite 自定义绘制使用
 struct ListItemDisplay {
@@ -106,5 +108,15 @@ bool InitDirectWrite();
 
 // 清理 DirectWrite 资源，恢复子类化窗口过程
 void CleanupDirectWrite();
+
+// ---- Win11 File Explorer 风格列表项原型 ----
+
+// 使用 Direct2D 绘制单个 Win11 风格列表项行（原型）
+// pRT:       处于 BeginDraw 状态的 D2D 渲染目标
+// rc:        该行的客户区矩形（相对于 ListView）
+// item:      该行的显示数据（displayName, duration, percent, status, iconIndex）
+// isSelected: 是否为当前选中行（影响背景色）
+void DrawListViewItem_Win11(ID2D1RenderTarget* pRT, const RECT& rc,
+                            const ListItemDisplay& item, bool isSelected);
 
 } // namespace PanelUI

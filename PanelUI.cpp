@@ -386,7 +386,12 @@ void UpdateHeader(const std::string& date, uint64_t totalSeconds) {
     g_currentViewDate = date;
 
     std::wstring wDate = ToWide(date);
-    std::wstring text = wDate + L"  |  " + FormatHeaderTotal(totalSeconds);
+    std::wstring text;
+    if (totalSeconds == 0) {
+        text = wDate + L"  |  No data";
+    } else {
+        text = wDate + L"  |  " + FormatHeaderTotal(totalSeconds);
+    }
 
     if (g_isHistoryMode) {
         text += L"  (history)";
@@ -1342,6 +1347,7 @@ void RefreshFull(const DailyData& data) {
 // ============================================================================
 
 void LoadHistoryData(const std::string& date, const DailyData& data) {
+    ListView_DeleteAllItems(hListView);
     g_isHistoryMode = true;
     g_currentViewDate = date;
     RefreshFull(data);
